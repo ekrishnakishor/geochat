@@ -8,150 +8,164 @@ const io = new Server(3000, {
   cors: { origin: "*" },
 });
 
-// --- STATE MANAGEMENT ---
-let queue = {
-  local: {},      // { "geohash": [socketId] }
-  global: {}      // { "india": [socketId], "us": [socketId] }
-};
-
-let users = {};   // { socketId: { partnerId, mode, region, ip } }
-
-// Load Blocked IPs from file (Persistent Ban)
+// STATE
+let queue = { local: {}, global: {} };
+let users = {}; 
+let disconnectHistory = {}; // { socketId: lastPartnerId }
 let blockedIPs = [];
-if (fs.existsSync("blocked.json")) {
-  blockedIPs = JSON.parse(fs.readFileSync("blocked.json"));
-}
 
-// --- HELPER: BAN USER ---
-function banUser(ip) {
-  if (!blockedIPs.includes(ip)) {
-    blockedIPs.push(ip);
-    fs.writeFileSync("blocked.json", JSON.stringify(blockedIPs));
-    console.log(`BANNED IP: ${ip}`);
-  }
+// Load blocked IPs
+if (fs.existsSync("blocked.json")) {
+  try { blockedIPs = JSON.parse(fs.readFileSync("blocked.json")); } catch (e) {}
 }
 
 io.on("connection", (socket) => {
-  // 1. GET IP ADDRESS
-  const clientIp = requestIp.getClientIp(socket.request); 
-  
-  // 2. CHECK BAN STATUS
+  // 1. FIX: Send Online Count IMMEDIATELY to the new user
+  socket.emit("users_count", io.engine.clientsCount);
+  // Then broadcast to everyone else
+  io.emit("users_count", io.engine.clientsCount);
+
+  const clientIp = requestIp.getClientIp(socket.request) || socket.handshake.address;
   if (blockedIPs.includes(clientIp)) {
-    socket.emit("banned", "You have been permanently banned for violating community guidelines.");
+    socket.emit("banned", "You have been banned.");
     socket.disconnect(true);
     return;
   }
 
-  // Broadcast online count
-  io.emit("users_count", io.engine.clientsCount);
+  // Initialize User
+  users[socket.id] = { ip: clientIp, partnerId: null, avatarSeed: null };
 
-  // --- FIND MATCH LOGIC ---
-  socket.on("find_match", ({ mode, region, lat, lon, name }) => {
-    // mode = 'local' or 'global'
-    // region = 'india', 'us', 'random' (only if mode is global)
-    
-    let matchKey;
-    let queueType;
+  // --- RECONNECT LOGIC ---
+socket.on("request_reconnect", () => {
+    const lastPartnerId = disconnectHistory[socket.id];
+    console.log(`[DEBUG] User ${socket.id} asked to reconnect. Last partner: ${lastPartnerId}`);
 
-    if (mode === "local") {
-      matchKey = ngeohash.encode(lat, lon, 5); // GeoHash for local
-      queueType = "local";
-    } else {
-      matchKey = region || "random"; // Region name for global
-      queueType = "global";
+    if (!lastPartnerId) {
+      console.log(`[DEBUG] No history found for ${socket.id}`);
+      socket.emit("system_message", "No recent partner found.");
+      return;
     }
 
-    // Try to find a partner
-    const partnerId = findMatch(queueType, matchKey, socket.id);
+    // Check if partner is in our "users" list
+    const targetUser = users[lastPartnerId];
+    if (!targetUser) {
+      console.log(`[DEBUG] Partner ${lastPartnerId} is no longer in memory.`);
+      socket.emit("system_message", "Partner has disconnected completely.");
+      return;
+    }
 
-    if (partnerId) {
-      // MATCH FOUND
-      removeFromQueue(queueType, matchKey, partnerId);
-      
-      users[socket.id] = { partnerId, ip: clientIp };
-      users[partnerId] = { partnerId: socket.id }; // Partner IP is already stored
+    // Check if they are already busy
+    if (targetUser.partnerId) {
+      console.log(`[DEBUG] Partner ${lastPartnerId} is already chatting.`);
+      socket.emit("system_message", "User is already in another chat.");
+      return;
+    }
 
-      io.to(socket.id).emit("match_found", { partnerName: "Stranger" });
-      io.to(partnerId).emit("match_found", { partnerName: name || "Stranger" });
+    // If we get here, it should work
+    console.log(`[DEBUG] Sending offer to ${lastPartnerId}`);
+    io.to(lastPartnerId).emit("reconnect_offer", { offererId: socket.id });
+    socket.emit("system_message", "Reconnection request sent!");
+  });
+
+  socket.on("accept_reconnect", ({ offererId }) => {
+    const me = users[socket.id];
+    const them = users[offererId];
+    if (me && them && !me.partnerId && !them.partnerId) {
+      me.partnerId = offererId;
+      them.partnerId = socket.id;
       
-    } else {
-      // NO MATCH - WAIT
-      if (!queue[queueType][matchKey]) queue[queueType][matchKey] = [];
-      queue[queueType][matchKey].push(socket.id);
-      
-      users[socket.id] = { partnerId: null, ip: clientIp, mode, matchKey };
-      socket.emit("waiting", mode === "local" ? "Scanning area..." : `Looking for someone in ${matchKey}...`);
+      delete disconnectHistory[socket.id];
+      delete disconnectHistory[offererId];
+
+      io.to(socket.id).emit("match_found", { partnerName: "Stranger", partnerAvatar: them.avatarSeed });
+      io.to(offererId).emit("match_found", { partnerName: "Stranger", partnerAvatar: me.avatarSeed });
     }
   });
 
-  // --- REPORT LOGIC ---
-  socket.on("report_user", () => {
+  // --- STANDARD MATCH LOGIC ---
+  socket.on("find_match", ({ mode, region, lat, lon, name, avatarSeed }) => {
     const user = users[socket.id];
-    if (user && user.partnerId) {
-      const partnerId = user.partnerId;
-      const partner = users[partnerId];
+    user.avatarSeed = avatarSeed;
+    user.mode = mode;
 
-      if (partner && partner.ip) {
-        // BAN THE PARTNER
-        banUser(partner.ip);
-        
-        // Notify the reporter
-        socket.emit("system_message", "User reported and blocked. Disconnecting...");
-        
-        // Disconnect the banned user
-        io.to(partnerId).emit("banned", "You have been reported and banned.");
-        io.sockets.sockets.get(partnerId)?.disconnect(true);
-        
-        // Disconnect reporter cleanly so they can find new match
-        cleanupUser(socket.id); 
-      }
+    let matchKey = mode === "local" ? ngeohash.encode(lat, lon, 5) : (region || "random");
+    let queueType = mode === "local" ? "local" : "global";
+    
+    user.matchKey = matchKey;
+    const partnerId = findMatch(queueType, matchKey, socket.id);
+
+    if (partnerId) {
+      removeFromQueue(queueType, matchKey, partnerId);
+      user.partnerId = partnerId;
+      users[partnerId].partnerId = socket.id;
+
+      io.to(socket.id).emit("match_found", { partnerName: "Stranger", partnerAvatar: users[partnerId].avatarSeed });
+      io.to(partnerId).emit("match_found", { partnerName: name || "Stranger", partnerAvatar: avatarSeed });
+    } else {
+      if (!queue[queueType][matchKey]) queue[queueType][matchKey] = [];
+      queue[queueType][matchKey].push(socket.id);
+      socket.emit("waiting", "Looking for partner...");
     }
   });
 
   socket.on("send_message", (msg) => {
     const user = users[socket.id];
+    if (user && user.partnerId) io.to(user.partnerId).emit("receive_message", { text: msg, sender: "them" });
+  });
+
+  socket.on("typing_start", () => {
+    const user = users[socket.id];
+    if (user && user.partnerId) io.to(user.partnerId).emit("partner_typing", true);
+  });
+
+  socket.on("typing_stop", () => {
+    const user = users[socket.id];
+    if (user && user.partnerId) io.to(user.partnerId).emit("partner_typing", false);
+  });
+
+  socket.on("leave_chat", () => {
+    const user = users[socket.id];
     if (user && user.partnerId) {
-      io.to(user.partnerId).emit("receive_message", { text: msg, sender: "them" });
+      const pid = user.partnerId;
+      disconnectHistory[socket.id] = pid;
+      disconnectHistory[pid] = socket.id;
+      
+      io.to(pid).emit("partner_left");
+      if(users[pid]) users[pid].partnerId = null;
+      user.partnerId = null;
+    }
+    if (user.matchKey) {
+        const type = user.mode === "local" ? "local" : "global";
+        removeFromQueue(type, user.matchKey, socket.id);
     }
   });
 
-  socket.on("leave_chat", () => cleanupUser(socket.id));
   socket.on("disconnect", () => {
-    cleanupUser(socket.id);
+    const user = users[socket.id];
+    if (user) {
+      if (user.partnerId) {
+        io.to(user.partnerId).emit("partner_left");
+        if(users[user.partnerId]) users[user.partnerId].partnerId = null;
+      }
+      if (user.matchKey) {
+        const type = user.mode === "local" ? "local" : "global";
+        removeFromQueue(type, user.matchKey, socket.id);
+      }
+      delete users[socket.id];
+    }
     io.emit("users_count", io.engine.clientsCount);
   });
 });
-
-// --- HELPERS ---
 
 function findMatch(type, key, myId) {
   if (!queue[type][key]) return null;
   return queue[type][key].find(id => id !== myId);
 }
-
 function removeFromQueue(type, key, id) {
   if (queue[type][key]) {
     queue[type][key] = queue[type][key].filter(socketId => socketId !== id);
     if (queue[type][key].length === 0) delete queue[type][key];
   }
-}
-
-function cleanupUser(id) {
-  const user = users[id];
-  if (!user) return;
-
-  if (user.partnerId) {
-    io.to(user.partnerId).emit("partner_left");
-    if(users[user.partnerId]) users[user.partnerId].partnerId = null;
-  }
-  
-  // Remove from whichever queue they were in
-  if (user.matchKey) {
-    const type = user.mode === "local" ? "local" : "global";
-    removeFromQueue(type, user.matchKey, id);
-  }
-  
-  delete users[id];
 }
 
 console.log("Server running...");
