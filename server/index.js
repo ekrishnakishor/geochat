@@ -4,9 +4,19 @@ const ngeohash = require("ngeohash");
 const requestIp = require("request-ip");
 const fs = require("fs");
 
-const io = new Server(3000, {
-  cors: { origin: "*" },
+// const io = new Server(3000, {
+//   cors: { origin: "*" },
+// });
+
+const PORT = process.env.PORT || 3000; // <--- CHANGE THIS
+
+const io = new Server(PORT, {
+  cors: {
+    origin: "*", // Allow all connections
+  },
 });
+
+console.log(`Server running on port ${PORT}...`);
 
 // STATE
 let queue = { local: {}, global: {} };

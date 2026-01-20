@@ -3,7 +3,7 @@ import { useState, useEffect, useRef } from "react";
 import io from "socket.io-client";
 
 // Initialize socket once
-const socket = io("http://localhost:3000");
+const socket = io("https://geochat-s776.onrender.com");
 const generateRandomSeed = () => Math.random().toString(36).substring(7);
 
 function App() {
