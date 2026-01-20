@@ -2,6 +2,7 @@
 import { useState, useEffect, useRef } from "react";
 import io from "socket.io-client";
 
+// Initialize socket once
 const socket = io("http://localhost:3000");
 const generateRandomSeed = () => Math.random().toString(36).substring(7);
 
@@ -11,18 +12,16 @@ function App() {
   const [inputText, setInputText] = useState("");
   const [status, setStatus] = useState("");
   const [onlineCount, setOnlineCount] = useState(0);
+  const [myId, setMyId] = useState("Connecting..."); // To debug ID changes
 
-  // Avatar & Typing
   const [myAvatar, setMyAvatar] = useState(generateRandomSeed());
   const [partnerAvatar, setPartnerAvatar] = useState("");
   const [isTyping, setIsTyping] = useState(false);
   const [reconnectOffer, setReconnectOffer] = useState(null);
   
-  // Settings
   const [mode, setMode] = useState("local");
   const [displayName, setDisplayName] = useState("");
 
-  // --- DEVELOPER CONSOLE STATE ---
   const [showDevLogs, setShowDevLogs] = useState(false);
   const [logs, setLogs] = useState([]);
 
@@ -30,29 +29,24 @@ function App() {
   const typingTimeoutRef = useRef(null);
   const logsEndRef = useRef(null);
 
-  // Helper to add logs to our Dev Console
   const addLog = (type, event, data) => {
     const time = new Date().toLocaleTimeString().split(" ")[0];
-    setLogs(prev => [...prev.slice(-49), { time, type, event, data }]); // Keep last 50 logs
+    setLogs(prev => [...prev.slice(-49), { time, type, event, data }]);
   };
 
+  // 1. ONE-TIME SOCKET SETUP (The Fix)
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, isTyping]);
-
-  // Scroll dev logs to bottom
-  useEffect(() => {
-    logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [logs, showDevLogs]);
-
-  useEffect(() => {
-    // 1. LISTEN TO EVERYTHING (Incoming)
-    socket.onAny((eventName, ...args) => {
-      if (eventName === "timer" || eventName === "typing_start") return; // Ignore spammy events
-      addLog("RX", eventName, args[0]);
+    // Get ID on connect
+    socket.on("connect", () => {
+      setMyId(socket.id);
+      addLog("SYS", "Connected", socket.id);
     });
 
-    // 2. STANDARD LISTENERS
+    // Listeners
+    socket.onAny((event, ...args) => {
+      if (event !== "timer" && event !== "typing_start") addLog("RX", event, args[0]);
+    });
+
     socket.on("users_count", (count) => setOnlineCount(count));
     
     socket.on("waiting", (msg) => {
@@ -62,11 +56,10 @@ function App() {
 
     socket.on("match_found", ({ partnerAvatar }) => {
       setStep("chat");
-      setMessages([]);
+      setMessages([]); // Clear chat on new match
       setPartnerAvatar(partnerAvatar);
       setStatus("Connected");
-      setReconnectOffer(null);
-      addLog("SYS", "Match Started", "Clearing previous state");
+      setReconnectOffer(null); 
     });
 
     socket.on("receive_message", (data) => {
@@ -83,16 +76,25 @@ function App() {
     });
 
     socket.on("reconnect_offer", ({ offererId }) => {
+      // Logic to show modal
       setReconnectOffer(offererId);
     });
 
     socket.on("system_message", (msg) => {
-        if(step === 'chat') setMessages((prev) => [...prev, { text: msg, type: "system" }]);
-        else alert(msg);
+      // If we are in lobby, show alert, otherwise show in chat
+      // We use a callback to check current step roughly, or just push to log
+      addLog("SYS", "Message", msg);
+      // We can push to chat even if in lobby, it just won't be seen until chat opens
+      // So let's use a browser alert if it's critical and we aren't in chat
+      setMessages((prev) => [...prev, { text: msg, type: "system" }]);
     });
 
+    // Request initial count
+    socket.emit("get_online_count");
+
     return () => {
-      socket.offAny(); // Cleanup global listener
+      socket.offAny();
+      socket.off("connect");
       socket.off("users_count");
       socket.off("waiting");
       socket.off("match_found");
@@ -102,15 +104,17 @@ function App() {
       socket.off("reconnect_offer");
       socket.off("system_message");
     };
-  }, [step]); // Re-run when step changes to ensure listeners are active
+  }, []); // <--- EMPTY DEPENDENCY ARRAY IS CRITICAL
 
-  // Wrapper for Emit to log Outgoing events
+  // Auto-scrolls
+  useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages, isTyping]);
+  useEffect(() => { logsEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [logs, showDevLogs]);
+
   const emit = (event, data) => {
     addLog("TX", event, data);
     socket.emit(event, data);
   };
 
-  // --- HANDLERS ---
   const handleStart = () => {
     const payload = { name: displayName, avatarSeed: myAvatar };
     if (mode === "local") {
@@ -125,24 +129,24 @@ function App() {
     }
   };
 
-  const handleInputChange = (e) => {
-    setInputText(e.target.value);
-    socket.emit("typing_start"); // Don't log this one, too spammy
-    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
-    typingTimeoutRef.current = setTimeout(() => socket.emit("typing_stop"), 1000);
-  };
-
   const sendMessage = (e) => {
     e.preventDefault();
     if (!inputText.trim()) return;
     socket.emit("typing_stop");
     setMessages((prev) => [...prev, { text: inputText, sender: "me" }]);
-    emit("send_message", inputText); // Use wrapper
+    emit("send_message", inputText);
     setInputText("");
   };
 
+  const handleInputChange = (e) => {
+    setInputText(e.target.value);
+    socket.emit("typing_start");
+    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+    typingTimeoutRef.current = setTimeout(() => socket.emit("typing_stop"), 1000);
+  };
+
   const handleExit = () => {
-    emit("leave_chat"); // Use wrapper
+    emit("leave_chat");
     setStep("lobby");
     setMessages([]);
     setIsTyping(false);
@@ -150,13 +154,13 @@ function App() {
   };
 
   const requestReconnect = () => {
-    emit("request_reconnect"); // Use wrapper
+    emit("request_reconnect");
     setMessages((prev) => [...prev, { text: "Sending request...", type: "system" }]);
   };
 
   const acceptReconnect = () => {
     if (reconnectOffer) {
-      emit("accept_reconnect", { offererId: reconnectOffer }); // Use wrapper
+      emit("accept_reconnect", { offererId: reconnectOffer });
       setReconnectOffer(null);
     }
   };
@@ -165,8 +169,6 @@ function App() {
 
   return (
     <div className="min-h-screen bg-slate-100 flex items-center justify-center p-4 font-sans relative">
-      
-      {/* --- APP CONTAINER --- */}
       <div className="w-full max-w-md bg-white rounded-2xl shadow-xl overflow-hidden border border-slate-200 flex flex-col h-[650px] relative z-10">
         
         {/* HEADER */}
@@ -204,11 +206,8 @@ function App() {
 
           {step === "searching" && (
             <div className="h-full flex flex-col items-center justify-center p-8 text-center">
-               <span className="relative flex h-20 w-20">
-                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-indigo-400 opacity-75"></span>
-                <span className="relative inline-flex rounded-full h-20 w-20 bg-indigo-500 items-center justify-center text-white text-2xl">🔍</span>
-              </span>
-              <h3 className="mt-8 text-xl font-semibold text-slate-700">Finding Partner...</h3>
+              <div className="animate-spin text-4xl mb-4">🔍</div>
+              <h3 className="text-xl font-semibold text-slate-700">Finding Partner...</h3>
               <button onClick={handleExit} className="mt-8 text-slate-400 underline">Cancel</button>
             </div>
           )}
@@ -229,7 +228,7 @@ function App() {
                 {isTyping && <div className="text-xs text-slate-400 ml-12">Stranger is typing...</div>}
                 <div ref={messagesEndRef} />
               </div>
-
+              
               {status === "Stranger left" && (
                 <div className="absolute bottom-20 left-0 right-0 flex justify-center z-20">
                   <button onClick={requestReconnect} className="bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-2 px-6 rounded-full shadow-lg border-2 border-white">↩️ Ask to Reconnect</button>
@@ -258,46 +257,24 @@ function App() {
         )}
       </div>
 
-      {/* --- DEVELOPER CONSOLE --- */}
-      <div className="fixed bottom-4 left-4 z-50 flex flex-col items-start gap-2">
-         {/* Toggle Button */}
-         <button 
-          onClick={() => setShowDevLogs(!showDevLogs)}
-          className="bg-slate-800 hover:bg-slate-700 text-white p-3 rounded-full shadow-xl transition-all"
-          title="Toggle Developer Logs"
-        >
-          {showDevLogs ? "❌" : "🐞"}
-        </button>
-
-        {/* Log Window */}
-        {showDevLogs && (
-          <div className="w-80 h-96 bg-slate-900 rounded-xl shadow-2xl border border-slate-700 flex flex-col overflow-hidden text-xs font-mono">
+      {/* DEV CONSOLE */}
+      <div className="fixed bottom-4 left-4 z-50">
+         <button onClick={() => setShowDevLogs(!showDevLogs)} className="bg-slate-800 text-white p-3 rounded-full shadow-xl">🐞</button>
+         {showDevLogs && (
+          <div className="absolute bottom-12 left-0 w-80 h-96 bg-slate-900 rounded-xl shadow-2xl border border-slate-700 flex flex-col text-xs font-mono overflow-hidden">
             <div className="bg-slate-800 p-2 text-slate-400 font-bold border-b border-slate-700 flex justify-between">
-              <span>CONSOLE</span>
-              <button onClick={() => setLogs([])} className="text-red-400 hover:text-red-300">CLEAR</button>
+              <span>MY ID: {myId.substring(0,6)}...</span>
+              <button onClick={() => setLogs([])} className="text-red-400">CLEAR</button>
             </div>
             <div className="flex-1 overflow-y-auto p-2 space-y-1">
-              {logs.length === 0 && <div className="text-slate-600 text-center mt-10">No logs yet...</div>}
               {logs.map((log, i) => (
-                <div key={i} className="break-words">
-                  <span className="text-slate-500">[{log.time}]</span>
-                  <span className={`font-bold mx-1 ${log.type === "TX" ? "text-blue-400" : "text-green-400"}`}>
-                    {log.type}
-                  </span>
-                  <span className="text-slate-300">{log.event}</span>
-                  {log.data && (
-                    <div className="text-slate-500 pl-4 border-l-2 border-slate-700 ml-1">
-                      {typeof log.data === 'object' ? JSON.stringify(log.data).substring(0, 100) : log.data}
-                    </div>
-                  )}
-                </div>
+                <div key={i} className="break-words"><span className="text-slate-500">[{log.time}]</span> <span className={`font-bold ${log.type==="TX"?"text-blue-400":"text-green-400"}`}>{log.type}</span> <span className="text-slate-300">{log.event}</span></div>
               ))}
               <div ref={logsEndRef} />
             </div>
           </div>
-        )}
+         )}
       </div>
-
     </div>
   );
 }

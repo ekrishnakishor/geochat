@@ -25,6 +25,10 @@ io.on("connection", (socket) => {
   // Then broadcast to everyone else
   io.emit("users_count", io.engine.clientsCount);
 
+  socket.on("get_online_count", () => {
+    socket.emit("users_count", io.engine.clientsCount);
+});
+
   const clientIp = requestIp.getClientIp(socket.request) || socket.handshake.address;
   if (blockedIPs.includes(clientIp)) {
     socket.emit("banned", "You have been banned.");
